@@ -48,7 +48,7 @@ cd userspace
 make
 ```
 
-运行前请自行准备固件：
+仓库已包含当前使用的固件文件：
 
 ```text
 userspace/firmware/dvb-usb-lme2510c-dtmb-5300.fw

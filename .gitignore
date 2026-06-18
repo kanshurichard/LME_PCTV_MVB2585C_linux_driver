@@ -14,3 +14,4 @@ userspace/lme2510_dtmb_libusb
 userspace/*.ts
 userspace/firmware/*
 !userspace/firmware/.gitkeep
+!userspace/firmware/dvb-usb-lme2510c-dtmb-5300.fw
