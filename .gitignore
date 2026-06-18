@@ -1,0 +1,16 @@
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+*.cmd
+.tmp_versions/
+Module.markers
+modules.order
+Module.symvers
+
+userspace/lme2510_dtmb_libusb
+userspace/*.ts
+userspace/firmware/*
+!userspace/firmware/.gitkeep
