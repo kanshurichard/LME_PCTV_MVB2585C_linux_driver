@@ -1,4 +1,17 @@
-# dtmb-linux
+# LME_PCTV_MVB2585C 第一波道DTMB电视棒 Linux 驱动
+
+本驱动fork自：https://gitee.com/xuyizai
+
+主要解决了原驱动严重卡顿和预置频点不全的问题。
+
+已添加香港全部频点，目前在香港可以搜到全部dtmb频道（仅限kernel，userspace部分因用不到，暂时未改）。
+
+TODO：
+
+- 将预置频点的模式改为所有频点自适应
+- 优化userspace部分
+
+# 以下为原作者内容：
 
 LME2510C + LGS8GL5 + MAX2165 的 Linux 侧代码整理。
 
