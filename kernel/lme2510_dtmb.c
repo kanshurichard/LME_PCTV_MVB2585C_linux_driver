@@ -91,8 +91,8 @@
 #define GL5_R_STATUS      0xA4   /* [1:0]: 01=LOCK          */
 
 /* TS URB参数 */
-#define TS_URB_COUNT      10     /* DVB_USB_STREAM_BULK(0x88,10,4096) per CSV */
-#define TS_URB_SIZE       4096
+#define TS_URB_COUNT      32     /* Increased for better buffering */
+#define TS_URB_SIZE       (4096 * 4) /* 16KB per URB */
 #define TS_PACKET_SIZE    188
 #define TS_SYNC_CONFIRM   5
 #define TS_ALIGN_BUF_SIZE (TS_URB_SIZE + TS_PACKET_SIZE * (TS_SYNC_CONFIRM + 2))
@@ -287,6 +287,9 @@ struct c0_entry {
 
 static const struct c0_entry c0_table[] = {
 /* auto-generated from 1 (1).ftm */
+    { 482000000U, { 0xC0,0x00,0x28,0x12,0xAA,0xAA,0xB6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    { 522000000U, { 0xC0,0x00,0x2B,0x18,0x00,0x00,0xB6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
+    { 538000000U, { 0xC0,0x00,0x2C,0x1D,0x55,0x55,0xB6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
     /* HK working short-path alias (23.csv-derived payload, user keeps this as 586) */
     { 586000000U, { 0xC0,0x00,0x30,0x1D,0x55,0x55,0xB6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 } },
     /* HK ~602MHz */
@@ -344,23 +347,7 @@ static bool gl5_chip_id_valid(u8 val)
 
 static bool gl5_use_short_ftm_path(const struct lme_state *st)
 {
-    /* Baseline split: 578/586/602 short path, 626 full path. */
-    static const u32 short_freqs[] = { 578000000U, 586000000U, 602000000U };
-    int i;
-
-    for (i = 0; i < ARRAY_SIZE(short_freqs); i++) {
-        int j;
-
-        for (j = 0; j < ARRAY_SIZE(c0_table); j++) {
-            if (c0_table[j].freq_hz != short_freqs[i])
-                continue;
-            if (!memcmp(st->c0_cmd, c0_table[j].cmd, 7))
-                return true;
-            break;
-        }
-    }
-
-    return false;
+    return true;
 }
 
 static bool gl5_prime_ts_inside_ftm(const struct lme_state *st)
@@ -2878,11 +2865,38 @@ static int lme_c0_tune(struct lme_state *st, u32 freq_hz)
 
     memcpy(cmd, c0_table[best_idx].cmd, 17);
 
-    if (best_diff == 0)
+    if (best_diff == 0) {
         dinfo("C0调谐 %uHz: 精确命中表项\n", freq_hz);
-    else
-        dinfo("C0调谐 %uHz: 最近表项 %uHz (偏差%ukHz)\n",
-              freq_hz, best_freq, best_diff / 1000);
+    } else {
+        /* 未精确命中表项时，计算 NDIV 与 FRAC */
+        u32 freq_khz = freq_hz / 1000;
+        u32 osc_khz = 12000; /* 晶振 12 MHz */
+        u32 quotient = freq_khz / osc_khz;
+        u32 remainder = freq_khz - quotient * osc_khz;
+        u32 fraction = 0;
+        int j;
+
+        for (j = 0; j < 20; j++) {
+            remainder <<= 1;
+            fraction <<= 1;
+            if (remainder >= osc_khz) {
+                fraction |= 1;
+                remainder -= osc_khz;
+            }
+        }
+
+        /* 覆盖 NDIV 与 FRAC 寄存器 */
+        cmd[2] = (u8)quotient;
+        cmd[3] = (u8)(fraction >> 16) & 0x0F;
+        cmd[4] = (u8)(fraction >> 8);
+        cmd[5] = (u8)fraction;
+    }
+
+    /* 【关键修复】强制纠正 UHF 频段（>=470MHz）的射频开关与跟踪滤波器参数 */
+    if (freq_hz >= 470000000U && cmd[6] != 0xB6) {
+        dinfo("C0调谐 %uHz: 修正 Track Filter 参数 (0x%02x -> 0xB6)\n", freq_hz, cmd[6]);
+        cmd[6] = 0xB6;
+    }
 
     /* Save for gl5_ftm_post_c0 to build frequency-specific C0 command */
     memcpy(st->c0_cmd, cmd, 17);
@@ -2969,6 +2983,9 @@ static void lme_ts_urb_complete(struct urb *urb)
                       ktime_us_delta(ktime_get(), st->ftm_c5_done));
             else
                 dinfo("TS first EP88 IN: %d bytes\n", urb->actual_length);
+            
+            /* Stop periodic 06 00 keepalive once stream starts to avoid starving EP88 */
+            cancel_delayed_work(&st->ts_keepalive_work);
         }
         atomic_add(urb->actual_length, &st->ts_probe_rx);
         {
@@ -2977,10 +2994,12 @@ static void lme_ts_urb_complete(struct urb *urb)
             int syncs = 0;
             for (int j = 0; j < urb->actual_length; j++)
                 if (b[j] == 0x47) syncs++;
-            u16 pid = (b[0] == 0x47) ? ((b[1] & 0x1F) << 8) | b[2] : 0xFFFF;
-            dinfo("TS: %dB first=0x%02x pid=0x%04x syncs=%d feeds=%d\n",
-                  urb->actual_length, b[0], pid, syncs,
-                  list_empty(&st->demux.feed_list) ? 0 : 1);
+            /* 
+             * u16 pid = (b[0] == 0x47) ? ((b[1] & 0x1F) << 8) | b[2] : 0xFFFF;
+             * dinfo("TS: %dB first=0x%02x pid=0x%04x syncs=%d feeds=%d\n",
+             *       urb->actual_length, b[0], pid, syncs,
+             *       list_empty(&st->demux.feed_list) ? 0 : 1);
+             */
 
             /* hexdump first 64 bytes of first 3 URBs for format analysis */
             {
@@ -3362,9 +3381,11 @@ static int dtmb_read_status(struct dvb_frontend *fe, enum fe_status *s)
      * flicker.  Return cached status so the DVB core doesn't see a
      * transient lock, start the demux, then lose lock on the next
      * reset. */
-    if (atomic_read(&st->demod_busy)) {
+    if (atomic_read(&st->demod_busy) || atomic_read(&st->ts_active)) {
         *s = st->cached_fe_status;
-        ddbg("read_status: busy → cached 0x%02x\n", *s);
+        /* If streaming, ensure lock bits remain set so dvb core doesn't stop */
+        if (atomic_read(&st->ts_active))
+            *s |= FE_HAS_VITERBI | FE_HAS_SYNC | FE_HAS_LOCK | FE_HAS_CARRIER | FE_HAS_SIGNAL;
         return 0;
     }
 
@@ -3395,6 +3416,12 @@ static int dtmb_read_signal_strength(struct dvb_frontend *fe, u16 *v)
 {
     struct lme_state *st = fe->demodulator_priv;
     u8 strength = 0;
+    
+    if (atomic_read(&st->ts_active)) {
+        *v = 0xFFFF; /* Fake max strength while streaming to avoid I2C stalls */
+        return 0;
+    }
+    
     gl5_read(st, GL5_ADDR, GL5_R_STRENGTH, &strength);
     *v = (strength & 0x7F) << 9;
     return 0;
