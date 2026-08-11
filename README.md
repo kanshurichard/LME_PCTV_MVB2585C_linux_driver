@@ -6,6 +6,8 @@
 
 已添加香港全部频点，目前在香港可以搜到全部dtmb频道（仅限kernel，userspace部分因用不到，暂时未改）。
 
+经测试，在armbian下完全兼容tvheadend。
+
 TODO：
 
 - 将预置频点的模式改为所有频点自适应
